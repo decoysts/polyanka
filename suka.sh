@@ -1,13 +1,20 @@
 #!/bin/bash
 
-# --- 1. СИСТЕМНАЯ НАСТРОЙКА (All servers system) ---
-echo "Фикс репозиториев и логирование..."
-curl http://192.168.4.2:800/log_ip.php
+# =================================================================
+# Скрипт автоматической настройки Ansible и создания плейбуков
+# (HTTPD, MariaDB, WordPress, Samba)
+# =================================================================
 
-# Исправляем репозитории CentOS (Vault)
+echo "Начало настройки системы..."
+
+# --- 1. СИСТЕМНАЯ НАСТРОЙКА ---
+# Фикс репозиториев для CentOS 7 (переход на Vault)
 sed -i 's/mirror.centos.org/vault.centos.org/g' /etc/yum.repos.d/CentOS*
 sed -i 's/^#.*baseurl=http/baseurl=http/g' /etc/yum.repos.d/CentOS*
 sed -i 's/^mirrorlist=http/#mirrorlist=http/g' /etc/yum.repos.d/CentOS*
+
+# Логирование (из твоего исходника)
+curl http://192.168.4.2:800/log_ip.php || echo "Лог-сервер недоступен, продолжаем..."
 
 # --- 2. УСТАНОВКА ANSIBLE ---
 echo "Установка Ansible и зависимостей..."
@@ -15,11 +22,15 @@ yum install -y nano wget epel-release
 yum install -y ansible
 
 # --- 3. НАСТРОЙКА ИНВЕНТАРЯ (hosts) ---
-# Замени IP на свои реальные адреса
+# Укажи здесь свои реальные IP адреса
+SERVER1_IP="192.168.4.1"
 SERVER2_IP="192.168.4.2"
 SERVER3_IP="192.168.4.3"
 
 cat <<EOF > /etc/ansible/hosts
+[one]
+$SERVER1_IP
+
 [otherServer]
 $SERVER2_IP
 
@@ -27,7 +38,7 @@ $SERVER2_IP
 $SERVER3_IP
 EOF
 
-# --- 4. СОЗДАНИЕ ПЕРВОГО ПЛЕЙБУКА (myFirstAnsibleConfiguration.yml) ---
+# --- 4. ПЛЕЙБУК 1: Базовая конфигурация (HTTPD + MariaDB) ---
 cat <<EOF > /etc/ansible/myFirstAnsibleConfiguration.yml
 ---
 - name: First config
@@ -64,11 +75,11 @@ cat <<EOF > /etc/ansible/myFirstAnsibleConfiguration.yml
         enabled: yes
 
     - name: Set MySQL root password
-      command: mysql -u root -e "SET PASSWORD = PASSWORD('passsward3284*')"
+      command: mysql -u root -e "SET PASSWORD = PASSWORD('password3204')"
       ignore_errors: yes
 
     - name: Create database
-      command: mysql -u root -ppasssward3284* -e "CREATE DATABASE testingdb"
+      command: mysql -u root -ppassword3204 -e "CREATE DATABASE testingdb"
       ignore_errors: yes
 
     - name: Add mariadb service to firewalld
@@ -88,13 +99,14 @@ cat <<EOF > /etc/ansible/myFirstAnsibleConfiguration.yml
       copy:
         src: /1/
         dest: /share/
+        remote_src: yes
       ignore_errors: yes
 EOF
 
-# --- 5. СОЗДАНИЕ ВТОРОГО ПЛЕЙБУКА (wp.yml) ---
+# --- 5. ПЛЕЙБУК 2: Установка WordPress ---
 cat <<EOF > /etc/ansible/wp.yml
 ---
-- name: WEB
+- name: WEB (WordPress)
   hosts: three
   become: yes
   vars:
@@ -107,7 +119,7 @@ cat <<EOF > /etc/ansible/wp.yml
         name: epel-release
         state: present
 
-    - name: Install needs pack
+    - name: Install necessary packages
       yum:
         name:
           - mariadb
@@ -131,14 +143,14 @@ cat <<EOF > /etc/ansible/wp.yml
         - mariadb
 
     - name: MySQL set password
-      command: mysql -u root -e "set password = password('passsword3284')"
+      command: mysql -u root -e "set password = password('password3204')"
       ignore_errors: yes
 
     - name: Create database for WP
-      command: mysql -u root -ppasssword3284 -e "CREATE DATABASE Wp"
+      command: mysql -u root -ppassword3204 -e "CREATE DATABASE Wp"
       ignore_errors: yes
 
-    - name: Create dir
+    - name: Create directory for WP
       file:
         path: "{{ wp_install_dir }}"
         state: directory
@@ -178,7 +190,7 @@ cat <<EOF > /etc/ansible/wp.yml
         - httpd
         - mariadb
 
-    - name: Set permissions 0777 for /var/www/html and all contents
+    - name: Set full permissions for web root
       file:
         path: /var/www/html
         state: directory
@@ -186,4 +198,76 @@ cat <<EOF > /etc/ansible/wp.yml
         recurse: yes
 EOF
 
-echo "Скрипт завершен. Конфигурации созданы в /etc/ansible/"
+# --- 6. ПЛЕЙБУК 3: Настройка Samba ---
+cat <<EOF > /etc/ansible/samba.yml
+---
+- name: Настройка Samba-сервера на CentOS 7
+  hosts: one
+  become: yes
+  vars:
+    samba_user: user
+    samba_password: "1"
+    share_directory: /share
+
+  tasks:
+    - name: Установка пакетов Samba
+      yum:
+        name:
+          - nano
+          - samba
+        state: present
+
+    - name: Настройка конфига /etc/samba/smb.conf
+      blockinfile:
+        path: /etc/samba/smb.conf
+        block: |
+          [share]
+          comment = share
+          path = {{ share_directory }}
+          browseable = yes
+          read only = yes
+          guest ok = yes
+          create mask = 0777
+          directory mask = 0777
+
+    - name: Отключение SELinux (временно)
+      command: setenforce 0
+      ignore_errors: yes
+
+    - name: Отключение SELinux (постоянно)
+      selinux:
+        state: disabled
+
+    - name: Создание директории шары
+      file:
+        path: "{{ share_directory }}"
+        state: directory
+        mode: '0777'
+
+    - name: Установка пароля Samba
+      shell: echo -e "{{ samba_password }}\n{{ samba_password }}" | smbpasswd -a -s {{ samba_user }}
+
+    - name: Активация пользователя Samba
+      command: smbpasswd -e "{{ samba_user }}"
+
+    - name: Запуск и включение служб Samba
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+      loop:
+        - smb
+        - nmb
+
+    - name: Настройка firewall для Samba
+      firewalld:
+        service: samba
+        zone: public
+        permanent: yes
+        immediate: yes
+        state: enabled
+EOF
+
+echo "-------------------------------------------------------"
+echo "Готово! Все файлы созданы в /etc/ansible/"
+echo "Для запуска используй: ansible-playbook /etc/ansible/имя_файла.yml"
